@@ -23,9 +23,12 @@ exports.getAll = async (req, res) => {
     const { category_id, search } = req.query;
     
     let query = `
-      SELECT et.*, ec.category_name
+      SELECT
+        et.*, ec.name AS category_name, et.created_by,
+        COUNT(DISTINCT e.expense_id) AS expense_count
       FROM expense_types et
-      JOIN expense_categories ec ON et.category_id = ec.category_id
+      JOIN expense_categories ec ON et.category_id = ec.id
+      LEFT JOIN expenses e ON et.type_id = e.type_id
       WHERE 1=1
     `;
     const params = [];
@@ -38,13 +41,13 @@ exports.getAll = async (req, res) => {
       params.push(category_id);
     }
 
-    if (search) {
-      paramCount++;
-      query += ` AND (et.type_name ILIKE $${paramCount} OR et.description ILIKE $${paramCount} OR ec.category_name ILIKE $${paramCount})`;
-      params.push(`%${search}%`);
-    }
+      if (search) {
+        paramCount++;
+        query += ` AND (et.type_name ILIKE $${paramCount} OR et.description ILIKE $${paramCount} OR ec.name ILIKE $${paramCount})`;
+        params.push(`%${search}%`);
+      }
 
-    query += ' ORDER BY ec.category_name, et.type_name';
+    query += ' GROUP BY et.type_id, ec.name, et.created_by, et.type_name, et.category_id, et.description, et.created_at, et.status ORDER BY ec.name, et.type_name';
 
     const { rows } = await pool.query(query, params);
     
@@ -66,13 +69,13 @@ exports.getAll = async (req, res) => {
 exports.getOne = async (req, res) => {
   try {
     const { id } = req.params;
-    const { rows } = await pool.query(
-      `SELECT et.*, ec.category_name
-       FROM expense_types et
-       JOIN expense_categories ec ON et.category_id = ec.category_id
-       WHERE et.type_id = $1`, 
-      [id]
-    );
+      const { rows } = await pool.query(
+        `SELECT et.*, ec.name AS category_name, et.created_by
+         FROM expense_types et
+         JOIN expense_categories ec ON et.category_id = ec.id
+         WHERE et.type_id = $1`, 
+        [id]
+      );
     
     if (!rows.length) {
       return res.status(404).json({
@@ -106,7 +109,10 @@ exports.create = async (req, res) => {
       });
     }
 
-    const { type_name, category_id, description } = req.body;
+  let { type_name, category_id, description, status } = req.body;
+  status = (status || 'active').toLowerCase();
+    // Get user info for audit
+    const user = req.user?.name || req.user?.email || 'Unknown';
 
     // Check for duplicate type name within the same category
     const duplicateCheck = await pool.query(
@@ -123,7 +129,7 @@ exports.create = async (req, res) => {
 
     // Verify category exists
     const categoryCheck = await pool.query(
-      `SELECT category_id FROM expense_categories WHERE category_id = $1`,
+      `SELECT id FROM expense_categories WHERE id = $1`,
       [category_id]
     );
     
@@ -135,9 +141,9 @@ exports.create = async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO expense_types (type_name, category_id, description)
-       VALUES ($1, $2, $3) RETURNING *`,
-      [type_name, category_id, description]
+      `INSERT INTO expense_types (type_name, category_id, description, status, created_by)
+       VALUES ($1, $2, $3, COALESCE($4, 'Active'), $5) RETURNING *`,
+      [type_name, category_id, description, status, user]
     );
 
     res.status(201).json({
@@ -165,7 +171,6 @@ exports.create = async (req, res) => {
 exports.update = async (req, res) => {
   try {
     const { id } = req.params;
-    
     // Validate input data
     const validationErrors = validateExpenseTypeData(req.body);
     if (validationErrors.length > 0) {
@@ -175,14 +180,35 @@ exports.update = async (req, res) => {
       });
     }
 
-    const { type_name, category_id, description } = req.body;
+    let { type_name, category_id, description, status } = req.body;
+    status = (status || 'active').toLowerCase();
+
+    // Fetch existing type to compare category_id
+    const existingTypeRes = await pool.query('SELECT category_id FROM expense_types WHERE type_id = $1', [id]);
+    if (!existingTypeRes.rows.length) {
+      return res.status(404).json({ success: false, message: 'Expense type not found' });
+    }
+    const oldCategoryId = existingTypeRes.rows[0].category_id;
+
+    // Prevent changing category if expenses exist for this type
+    if (category_id && category_id !== oldCategoryId) {
+      const expenseCheck = await pool.query(
+        `SELECT COUNT(*) FROM expenses WHERE type_id = $1`,
+        [id]
+      );
+      if (parseInt(expenseCheck.rows[0].count) > 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Cannot change category for a type with logged expenses'
+        });
+      }
+    }
 
     // Check for duplicate type name within the same category (excluding current record)
     const duplicateCheck = await pool.query(
       `SELECT type_id FROM expense_types WHERE type_name = $1 AND category_id = $2 AND type_id != $3`,
       [type_name, category_id, id]
     );
-    
     if (duplicateCheck.rowCount > 0) {
       return res.status(409).json({
         success: false,
@@ -192,10 +218,9 @@ exports.update = async (req, res) => {
 
     // Verify category exists
     const categoryCheck = await pool.query(
-      `SELECT category_id FROM expense_categories WHERE category_id = $1`,
+      `SELECT id FROM expense_categories WHERE id = $1`,
       [category_id]
     );
-    
     if (categoryCheck.rowCount === 0) {
       return res.status(400).json({
         success: false,
@@ -205,18 +230,16 @@ exports.update = async (req, res) => {
 
     const result = await pool.query(
       `UPDATE expense_types 
-       SET type_name = $1, category_id = $2, description = $3, updated_at = NOW()
-       WHERE type_id = $4 RETURNING *`,
-      [type_name, category_id, description, id]
+       SET type_name = $1, category_id = $2, description = $3, status = $4, updated_at = NOW()
+       WHERE type_id = $5 RETURNING *`,
+      [type_name, category_id, description, status, id]
     );
-
     if (result.rowCount === 0) {
       return res.status(404).json({
         success: false,
         message: 'Expense type not found'
       });
     }
-
     res.json({
       success: true,
       data: result.rows[0],
@@ -285,7 +308,7 @@ exports.getStats = async (req, res) => {
       SELECT 
         COUNT(*) as total_types,
         COUNT(DISTINCT et.category_id) as categories_used,
-        COUNT(e.expense_id) as total_expenses_using_types
+        COUNT(DISTINCT e.expense_id) as total_expenses_using_types
       FROM expense_types et
       LEFT JOIN expenses e ON et.type_id = e.type_id
     `;
